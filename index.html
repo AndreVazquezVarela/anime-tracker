@@ -1,0 +1,321 @@
+// ─── CONSTANTES ───────────────────────────────────────────────
+const ANILIST_URL = 'https://graphql.anilist.co';
+const DAYS_ES = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+const DAYS_SHORT = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+
+// AniList usa estos valores para el día de emisión
+const ANILIST_DAYS = {
+  SUNDAY: 0, MONDAY: 1, TUESDAY: 2, WEDNESDAY: 3,
+  THURSDAY: 4, FRIDAY: 5, SATURDAY: 6
+};
+
+// ─── ESTADO ───────────────────────────────────────────────────
+let myList = JSON.parse(localStorage.getItem('animeList') || '[]');
+let searchResults = [];
+let deferredInstallPrompt = null;
+
+// ─── PWA: INSTALL PROMPT ──────────────────────────────────────
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  const banner = document.getElementById('installBanner');
+  if (banner) banner.style.display = 'flex';
+});
+
+// ─── SERVICE WORKER ───────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+
+// ─── GUARDAR LISTA ────────────────────────────────────────────
+function saveList() {
+  localStorage.setItem('animeList', JSON.stringify(myList));
+}
+
+// ─── QUERY ANILIST ────────────────────────────────────────────
+async function searchAniList(query) {
+  const gql = `
+    query ($search: String) {
+      Page(perPage: 8) {
+        media(search: $search, type: ANIME, status: RELEASING, sort: POPULARITY_DESC) {
+          id
+          title { romaji english }
+          coverImage { medium }
+          episodes
+          nextAiringEpisode { episode airingAt }
+          airingSchedule(notYetAired: false, perPage: 1) {
+            nodes { episode airingAt }
+          }
+          startDate { year }
+        }
+      }
+    }
+  `;
+  const res = await fetch(ANILIST_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({ query: gql, variables: { search: query } })
+  });
+  const data = await res.json();
+  return data?.data?.Page?.media || [];
+}
+
+// ─── OBTENER DÍA DE EMISIÓN ───────────────────────────────────
+function getAiringDay(anime) {
+  // Intentamos sacar el día del próximo episodio o del último emitido
+  const ts = anime.nextAiringEpisode?.airingAt
+    || anime.airingSchedule?.nodes?.[0]?.airingAt;
+  if (!ts) return null;
+  return new Date(ts * 1000).getDay(); // 0=domingo...6=sábado
+}
+
+function getAiringTime(anime) {
+  const ts = anime.nextAiringEpisode?.airingAt
+    || anime.airingSchedule?.nodes?.[0]?.airingAt;
+  if (!ts) return null;
+  return new Date(ts * 1000);
+}
+
+// ─── ESTADO DEL EPISODIO SEMANAL ──────────────────────────────
+function getEpisodeStatus(anime) {
+  const today = new Date();
+  const todayDay = today.getDay();
+  const animeDay = anime.day;
+
+  if (animeDay === null || animeDay === undefined) return { label: '?', cls: 'upcoming' };
+
+  if (animeDay === todayDay) return { label: '¡Hoy!', cls: 'today' };
+
+  // Calcular si ya salió esta semana (desde el lunes anterior)
+  const startOfWeek = new Date(today);
+  const diff = (today.getDay() + 6) % 7; // lunes = 0
+  startOfWeek.setDate(today.getDate() - diff);
+  startOfWeek.setHours(0, 0, 0, 0);
+
+  // Día de la semana del anime en formato lunes=0
+  const animeDayFromMonday = (animeDay + 6) % 7;
+  const todayFromMonday = (todayDay + 6) % 7;
+
+  if (animeDayFromMonday < todayFromMonday) {
+    return { label: 'Ya salió', cls: 'aired' };
+  } else {
+    return { label: DAYS_SHORT[animeDay], cls: 'upcoming' };
+  }
+}
+
+// ─── TÍTULO PREFERIDO ─────────────────────────────────────────
+function getTitle(anime) {
+  return anime.title?.english || anime.title?.romaji || 'Sin título';
+}
+
+// ─── RENDER: BÚSQUEDA ─────────────────────────────────────────
+function renderSearchResults(results) {
+  const container = document.getElementById('searchResults');
+  const status = document.getElementById('searchStatus');
+
+  if (!results.length) {
+    status.innerHTML = '<p class="status-msg">No se encontraron animes en emisión con ese nombre.</p>';
+    container.innerHTML = '';
+    return;
+  }
+
+  status.innerHTML = '';
+  container.innerHTML = results.map(anime => {
+    const day = getAiringDay(anime);
+    const dayLabel = day !== null ? DAYS_ES[day] : 'Día desconocido';
+    const inList = myList.some(a => a.id === anime.id);
+    const title = getTitle(anime);
+    const nextEp = anime.nextAiringEpisode?.episode
+      ? `Ep. ${anime.nextAiringEpisode.episode} próximamente` : '';
+
+    return `
+      <div class="anime-card">
+        <img src="${anime.coverImage?.medium || ''}" alt="${title}" loading="lazy" onerror="this.style.visibility='hidden'">
+        <div class="info">
+          <div class="title">${title}</div>
+          <div class="meta">${nextEp || (anime.episodes ? anime.episodes + ' eps' : 'En emisión')}</div>
+          <span class="day-badge ${day === null ? 'unknown' : ''}">${dayLabel}</span><br>
+          <button class="add-btn" onclick="addAnime(${anime.id})" ${inList ? 'disabled' : ''}>
+            ${inList ? '✓ Añadido' : '+ Añadir'}
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── AÑADIR A MI LISTA ────────────────────────────────────────
+function addAnime(id) {
+  const anime = searchResults.find(a => a.id === id);
+  if (!anime || myList.some(a => a.id === id)) return;
+
+  const day = getAiringDay(anime);
+
+  myList.push({
+    id: anime.id,
+    title: getTitle(anime),
+    image: anime.coverImage?.medium || '',
+    day: day,
+    episodes: anime.episodes || null
+  });
+
+  saveList();
+  renderSearchResults(searchResults); // actualizar botones
+}
+
+// ─── ELIMINAR DE MI LISTA ─────────────────────────────────────
+function removeAnime(id) {
+  myList = myList.filter(a => a.id !== id);
+  saveList();
+  renderList();
+  renderCalendar();
+}
+
+// ─── RENDER: CALENDARIO ───────────────────────────────────────
+function renderCalendar() {
+  const container = document.getElementById('calendarView');
+  const today = new Date().getDay();
+
+  if (!myList.length) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">📅</div>
+        <p>Tu calendario está vacío.<br>Busca animes y añádelos a tu lista.</p>
+      </div>`;
+    return;
+  }
+
+  // Ordenar días empezando por hoy
+  const orderedDays = [];
+  for (let i = 0; i < 7; i++) {
+    orderedDays.push((today + i) % 7);
+  }
+
+  container.innerHTML = orderedDays.map(dayNum => {
+    const animes = myList.filter(a => a.day === dayNum);
+    const isToday = dayNum === today;
+
+    const cards = animes.map(anime => {
+      const status = getEpisodeStatus(anime);
+      return `
+        <div class="cal-card">
+          <img src="${anime.image}" alt="${anime.title}" loading="lazy" onerror="this.style.visibility='hidden'">
+          <div class="cal-info">
+            <div class="cal-title">${anime.title}</div>
+            <div class="cal-meta">${anime.episodes ? anime.episodes + ' eps' : 'En emisión'}</div>
+          </div>
+          <span class="ep-status ${status.cls}">${status.label}</span>
+        </div>
+      `;
+    }).join('');
+
+    const emptyMsg = animes.length === 0
+      ? '<p class="empty-day">Sin animes</p>' : '';
+
+    return `
+      <div class="calendar-day ${isToday ? 'today' : ''}">
+        <div class="day-header">
+          <span class="day-name">${DAYS_ES[dayNum]}</span>
+          ${isToday ? '<span class="today-pill">Hoy</span>' : ''}
+        </div>
+        ${cards}${emptyMsg}
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── RENDER: MI LISTA ─────────────────────────────────────────
+function renderList() {
+  const container = document.getElementById('listView');
+
+  if (!myList.length) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">🎌</div>
+        <p>Tu lista está vacía.<br>Ve a "Buscar" para añadir animes.</p>
+      </div>`;
+    return;
+  }
+
+  container.innerHTML = myList.map(anime => {
+    const dayLabel = anime.day !== null && anime.day !== undefined
+      ? DAYS_ES[anime.day] : 'Día desconocido';
+
+    return `
+      <div class="list-card">
+        <img src="${anime.image}" alt="${anime.title}" loading="lazy" onerror="this.style.visibility='hidden'">
+        <div class="info">
+          <div class="title">${anime.title}</div>
+          <div class="meta">${dayLabel} · ${anime.episodes ? anime.episodes + ' eps' : 'En emisión'}</div>
+        </div>
+        <button class="remove-btn" onclick="removeAnime(${anime.id})">Quitar</button>
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── NAVEGACIÓN ───────────────────────────────────────────────
+function switchTab(tabName) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tabName).classList.add('active');
+  document.querySelector(`[data-tab="${tabName}"]`).classList.add('active');
+
+  if (tabName === 'calendar') renderCalendar();
+  if (tabName === 'list') renderList();
+}
+
+// ─── BÚSQUEDA ─────────────────────────────────────────────────
+async function doSearch() {
+  const q = document.getElementById('searchInput').value.trim();
+  if (!q) return;
+
+  const status = document.getElementById('searchStatus');
+  const results = document.getElementById('searchResults');
+  status.innerHTML = '<p class="status-msg">Buscando...</p>';
+  results.innerHTML = '';
+
+  try {
+    searchResults = await searchAniList(q);
+    renderSearchResults(searchResults);
+  } catch (e) {
+    status.innerHTML = '<p class="status-msg" style="color:#DC2626">Error al buscar. Comprueba tu conexión.</p>';
+  }
+}
+
+// ─── EVENTOS ──────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  // Tabs
+  document.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+
+  // Búsqueda
+  document.getElementById('searchBtn').addEventListener('click', doSearch);
+  document.getElementById('searchInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doSearch();
+  });
+
+  // Banner de instalación PWA
+  const installBanner = document.getElementById('installBanner');
+  const installBtn = document.getElementById('installBtn');
+  const closeBanner = document.getElementById('closeBanner');
+
+  if (installBtn) {
+    installBtn.addEventListener('click', async () => {
+      if (!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      const { outcome } = await deferredInstallPrompt.userChoice;
+      if (outcome === 'accepted') installBanner.style.display = 'none';
+      deferredInstallPrompt = null;
+    });
+  }
+
+  if (closeBanner) {
+    closeBanner.addEventListener('click', () => {
+      installBanner.style.display = 'none';
+    });
+  }
+});

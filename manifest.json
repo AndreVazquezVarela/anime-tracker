@@ -1,0 +1,30 @@
+from PIL import Image, ImageDraw, ImageFont
+import os
+
+os.makedirs('icons', exist_ok=True)
+
+def make_icon(size):
+    img = Image.new('RGB', (size, size), '#7C3AED')
+    draw = ImageDraw.Draw(img)
+    # Círculo blanco de fondo
+    margin = size // 6
+    draw.ellipse([margin, margin, size - margin, size - margin], fill='white')
+    # Emoji / texto
+    font_size = size // 3
+    try:
+        font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', font_size)
+    except:
+        font = ImageFont.load_default()
+    text = '🎌'
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+    except:
+        tw, th = font_size, font_size
+    draw.text(((size - tw) / 2, (size - th) / 2 - size // 20), text, fill='#7C3AED', font=font)
+    img.save(f'icons/icon-{size}.png')
+    print(f'Icono {size}x{size} generado')
+
+make_icon(192)
+make_icon(512)
